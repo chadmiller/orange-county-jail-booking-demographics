@@ -1,0 +1,134 @@
+#!/bin/sh
+# vi: filetype=python :
+""":"
+if test "$#" -gt 0; then cat $1; else wget -q -O - ftp://ftp.ocfl.net/divisions/corrections/pub/bookings.pdf ; fi |pdftotext -layout -nopgbrk -x 0 -y 65 -W 10000 -H 700 - - |chronic python3 "$0" || wget -q ftp://ftp.ocfl.net/divisions/corrections/pub/bookings.pdf
+exit 0
+
+# That above is some crazy magic Chad made to run some shell stuff and python
+# stuff in the same file. Do not be alarmed.
+
+chronic is in "moreutils" Ubuntu/Debian package
+pdftotext is in "poppler-utils"
+"""
+
+
+import sys
+import re
+import os
+import datetime
+import requests
+
+u, p = os.environ["u"], os.environ["p"]
+tok = "VuUWUpMu4pPnYES285t3R6WqK"
+
+day = None
+bookings = []
+next_is_addr_and_eth = False
+checked = False
+for line in sys.stdin:
+    line = line.rstrip()
+    print(line)
+
+    if not line: continue
+    if line.endswith('    Race/'): continue
+    if line.endswith('    Gender/'): continue
+    if line.startswith("Name    ") and line.endswith('Release Date/Time'): continue
+    if line.endswith("                    / DEGREE"): continue
+
+    # '  AP6-2              MISDEMEANOR / SECOND DEGREE ALCOHOL-POSSESS OR CONSUME IN PUBLIC'
+    # '  784.045(1)(a)(2)-14 FELONY / SECOND DEGREE         AGGRAVATED BATTERY WITH A FIREARM'
+    if re.match(r"""
+            ^\s{2,3}
+            (?:\d|PLEA|CITY|CNTY|OC|WP|AP)(?:\.|\d[A-Z]?|\([A-Z]\)|\([a-z]\)|\([0-9]{1,3}\)|-)+
+            \s+
+            (?:FELONY|MISDEMEANOR)\s/\s(CAPITOL|LIFE|FIRST|SECOND|THIRD|\s{3,10})?\s?DEGREE""", line, re.VERBOSE): continue
+
+    #              '  CASE: DP174'
+    #              '  CASE:                               ORLANDO PD'
+    m3 = re.match(r"\s{2,3}CASE:(?:| \w.{4,20}|(?: \w.{6,20}\s{5,}|\s{24,})(\S.*?)\s*)$", line)
+    if m3:
+        if m3.group(1):
+            bookings[-1]["agency"] = m3.group(1).title()
+        continue
+
+    if next_is_addr_and_eth:
+        '   ORLANDO, FL 32801                                 NON-HISPANIC'
+        m2 = re.match(r"""
+                ^\s\s
+                .*?
+                \s{3}
+                ((?:NON-)?HISPANIC|UNKNOWN)
+                (\s{3,}ZNA)?$""", line, re.VERBOSE)
+        if not m2:
+            print(repr(line))
+        assert day
+        bookings.append({"ID":"orangejail/{}/{}".format(day, int(m1.group(1))), "reportday": day, "bookingid":int(m1.group(1)), "race":m1.group(2).lower(), "sex":m1.group(3).lower(), "ageyears":int(m1.group(4)), "ethnicity":m2.group(1).lower(), "agency":None, "raceethnicity":"{} {}".format({"b":"black", "w":"white", "u":"", "a":"asian"}[m1.group(2).lower()], m2.group(1).lower()).strip(), "zna": not not m2.group(2)})
+        m1 = None
+        next_is_addr_and_eth = False
+        continue
+
+    # 'COLONMALDONADO, STEPHANIE MARGARITA'
+    # 'DEOLIVEIRARODRIGUES, GEORGIA MOHANA17003257            W/F         39   --                 2/3/2017 8:11:56AM
+    # 'GAYDENDOWDELL, TERRY CHRISTOPHER 17002432                W/M        27    --                 1/26/2017 11:03:11PM'
+    # "Q', E                                  17006089        W/M          0   --                 3/2/2017 10:46:32PM"
+    # "BAPTISTE, WISLY JEAN                   17014464      B/U        52    --                 5/22/2017 9:47:15PM"
+    m1 = re.match(r"""
+            ^(?:\w|-\w|'|,|\s\b)*  (?# LASTNAME, FIRST MIDDLE)
+            \s*
+            (\d{8})
+            \s{3,}
+            ([BWUA])/([FMU])
+            \s*
+            (\d?\d?\d)
+            \s{2}  .*""", line, re.VERBOSE)
+    if m1:
+        next_is_addr_and_eth = True
+        continue
+
+    # '  TOTAL INMATES THIS REPORT: 62'
+    mcheck = re.match("^ {1,2}TOTAL INMATES THIS REPORT: (\d+)", line)
+    if mcheck:
+        checked = int(mcheck.group(1)) == len(bookings), (len(bookings), line)
+        continue
+
+
+    m = re.match("^\s{18,}BEGINNING AT MIDNIGHT (.*)", line)
+    if m:
+        day = datetime.datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+        continue
+
+    raise ValueError("Unknown line: " + repr(line))
+
+assert checked
+
+# Step 1: Send rows with ids.
+response = requests.post("https://brigades.opendatanetwork.com/resource/tcsm-6pxj.json", headers={"X-App-Token": tok}, auth=(u, p), json=bookings)
+assert response.status_code == 200, (response, response.text)
+data = response.json()
+assert data["Errors"] == 0, data
+assert (data['Rows Updated'] + data['Rows Created']) > 10, data
+
+# Step 2: Send self as attachment. In three substeps.
+# - Upload self as an "asset".
+response = requests.post("https://brigades.opendatanetwork.com/api/assets", headers={"X-App-Token": tok}, auth=(u, p), files={ "file": ("unused field", open(sys.argv[0], "rb"), "text/x-python") })
+print(response)
+asset_upload = response.json()
+print(asset_upload)
+assert response.status_code == 200, (response, response.text)
+assert "id" in asset_upload and asset_upload["id"]
+
+# - Get metadata.
+response = requests.get("https://brigades.opendatanetwork.com/views/tcsm-6pxj.json", headers={"X-App-Token": tok}, auth=(u, p))
+assert response.status_code == 200, (response, response.text)
+metadata = response.json()["metadata"]
+attachments = metadata.get("attachments", [])
+
+# - Update metadata to link that asset to the dataset.
+attachments = [a for a in attachments if a["name"] != (u + "/uploader")]  # remove old copy of script
+attachments.append({'blobId': asset_upload["id"], 'name': u + "/uploader", 'filename': u + "/uploader"})
+metadata["attachments"] = attachments
+
+response = requests.put("https://brigades.opendatanetwork.com/views/tcsm-6pxj.json", headers={"X-App-Token": tok}, auth=(u, p), json={ "metadata": metadata })
+assert response.status_code == 200, (response, response.text)
+
+
